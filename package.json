@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "start": "serve -s dist -l ${PORT:-4173}"
+    "start": "serve -s dist -l tcp://0.0.0.0:${PORT:-4173}"
   },
   "dependencies": {
     "react": "^18.3.1",
