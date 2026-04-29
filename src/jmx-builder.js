@@ -13,17 +13,24 @@ import { escapeXml, parseUrl } from './utils.js';
 const TEST_TYPE_EQUALS = 8;
 const TEST_TYPE_SUBSTRING = 16;
 
+const SUPPORTED_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
+
 /**
  * Build a JMeter .jmx XML string from a config object.
  *
  * config = {
  *   testPlanName, threadGroupName,
  *   url,
+ *   method,          // "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+ *   contentType,     // e.g. "application/json" — used when body is present
+ *   body,            // raw request body (string), only sent for POST/PUT/PATCH
+ *   headers,         // [{ name, value }, ...]
  *   threads, rampUp, loops,
  *   assertions: {
- *     responseCode:  { enabled, value },   // value: string like "200"
- *     responseTime:  { enabled, value },   // value: ms as string/number
- *     bodyContains:  { enabled, value },   // value: substring
+ *     responseCode:  { enabled, value },
+ *     responseTime:  { enabled, value },
+ *     bodyContains:  { enabled, value },
  *   }
  * }
  */
@@ -40,6 +47,24 @@ export function buildJmx(config) {
 
   const { protocol, hostname, port, path } = parseUrl(url);
 
+  const method = normalizeMethod(config.method);
+  const headers = normalizeHeaders(config.headers);
+  const hasBody = METHODS_WITH_BODY.has(method) && (config.body ?? '') !== '';
+  const body = hasBody ? String(config.body) : '';
+  const contentType = (config.contentType || '').trim();
+
+  // Auto-attach Content-Type only when sending a body and the user hasn't
+  // already declared one (case-insensitive match).
+  const finalHeaders = [...headers];
+  if (hasBody && contentType) {
+    const hasCT = finalHeaders.some(
+      (h) => h.name.trim().toLowerCase() === 'content-type'
+    );
+    if (!hasCT) {
+      finalHeaders.unshift({ name: 'Content-Type', value: contentType });
+    }
+  }
+
   const tpName = escapeXml(testPlanName || 'Test Plan');
   const tgName = escapeXml(threadGroupName || 'Thread Group');
   const httpName = escapeXml('HTTP Request');
@@ -48,7 +73,19 @@ export function buildJmx(config) {
   const ramp = Math.max(0, parseInt(rampUp, 10) || 0);
   const loopCount = Math.max(1, parseInt(loops, 10) || 1);
 
+  const argumentsXml = hasBody
+    ? buildRawBodyArguments(body)
+    : `            <collectionProp name="Arguments.arguments"/>`;
+
+  const headerManagerXml = buildHeaderManager(finalHeaders);
   const assertionXml = buildAssertions(assertions);
+
+  // The HTTPSamplerProxy hashTree contains: header manager (if any) followed
+  // by assertion blocks. JMeter doesn't care about ordering between them but
+  // header managers conventionally appear first.
+  const samplerChildren = [headerManagerXml, assertionXml]
+    .filter(Boolean)
+    .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
@@ -84,26 +121,75 @@ export function buildJmx(config) {
           <stringProp name="HTTPSampler.protocol">${escapeXml(protocol)}</stringProp>
           <stringProp name="HTTPSampler.contentEncoding"></stringProp>
           <stringProp name="HTTPSampler.path">${escapeXml(path)}</stringProp>
-          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <stringProp name="HTTPSampler.method">${method}</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
           <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
           <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
           <stringProp name="HTTPSampler.connect_timeout"></stringProp>
-          <stringProp name="HTTPSampler.response_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout"></stringProp>${hasBody ? `
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>` : ''}
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
-            <collectionProp name="Arguments.arguments"/>
+${argumentsXml}
           </elementProp>
         </HTTPSamplerProxy>
         <hashTree>
-${assertionXml}
+${samplerChildren}
         </hashTree>
       </hashTree>
     </hashTree>
   </hashTree>
 </jmeterTestPlan>
 `;
+}
+
+function normalizeMethod(method) {
+  const upper = String(method || 'GET').toUpperCase();
+  return SUPPORTED_METHODS.includes(upper) ? upper : 'GET';
+}
+
+function normalizeHeaders(headers) {
+  if (!Array.isArray(headers)) return [];
+  return headers
+    .map((h) => ({
+      name: String(h?.name ?? '').trim(),
+      value: String(h?.value ?? ''),
+    }))
+    .filter((h) => h.name !== '');
+}
+
+function buildRawBodyArguments(body) {
+  // postBodyRaw mode: a single HTTPArgument whose value is the entire body.
+  // The empty Argument.metadata "=" and always_encode=false are what JMeter's
+  // raw-body GUI persists.
+  return `            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">${escapeXml(body)}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>`;
+}
+
+function buildHeaderManager(headers) {
+  if (!headers || headers.length === 0) return '';
+
+  const rows = headers
+    .map(
+      (h) => `            <elementProp name="${escapeXml(h.name)}" elementType="Header">
+              <stringProp name="Header.name">${escapeXml(h.name)}</stringProp>
+              <stringProp name="Header.value">${escapeXml(h.value)}</stringProp>
+            </elementProp>`
+    )
+    .join('\n');
+
+  return `          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">
+            <collectionProp name="HeaderManager.headers">
+${rows}
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>`;
 }
 
 function buildAssertions(assertions = {}) {

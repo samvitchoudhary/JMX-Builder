@@ -8,9 +8,15 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
+
 /**
  * @param {{
  *   url: string,
+ *   method?: string,
+ *   contentType?: string,
+ *   body?: string,
+ *   headers?: { name: string, value: string }[],
  *   threads: number|string,
  *   rampUp: number|string,
  *   loops: number|string,
@@ -24,10 +30,14 @@ export async function runSimulation(config, onSample, onProgress) {
   const url = String(config.url || '').trim();
   if (!url) throw new Error('URL is required');
 
+  const method = String(config.method || 'GET').toUpperCase();
   const threads = Math.max(1, parseInt(config.threads, 10) || 1);
   const loops = Math.max(1, parseInt(config.loops, 10) || 1);
   const rampUp = Math.max(0, Number(config.rampUp) || 0);
   const assertions = config.assertions || {};
+  const headers = Array.isArray(config.headers) ? config.headers : [];
+  const body = config.body ?? '';
+  const contentType = config.contentType || '';
 
   const total = threads * loops;
   const stagger = threads > 0 ? (rampUp * 1000) / threads : 0;
@@ -43,8 +53,12 @@ export async function runSimulation(config, onSample, onProgress) {
       (async () => {
         if (startDelay > 0) await sleep(startDelay);
         for (let l = 0; l < loops; l++) {
-          const sample = await runOne({
+          const sample = await runOneSample({
             url,
+            method,
+            body,
+            contentType,
+            headers,
             assertions,
             thread: t + 1,
             iter: l + 1,
@@ -63,12 +77,13 @@ export async function runSimulation(config, onSample, onProgress) {
   return samples;
 }
 
-async function runOne({ url, assertions, thread, iter, seq }) {
+async function runOneSample(config) {
+  const { url, method, body, contentType, headers, assertions } = config;
   const sample = {
-    seq,
-    id: `${thread}-${iter}-${seq}`,
-    thread,
-    iter,
+    seq: config.seq,
+    id: `${config.thread}-${config.iter}-${config.seq}`,
+    thread: config.thread,
+    iter: config.iter,
     status: null,
     timeMs: 0,
     error: null,
@@ -77,9 +92,23 @@ async function runOne({ url, assertions, thread, iter, seq }) {
     pass: false,
   };
 
+  const willSendBody = METHODS_WITH_BODY.has(method) && body !== '';
+
+  const fetchOptions = {
+    method,
+    headers: buildHeadersObject(
+      headers,
+      contentType,
+      willSendBody ? body : ''
+    ),
+  };
+  if (willSendBody) {
+    fetchOptions.body = body;
+  }
+
   const startedAt = performance.now();
   try {
-    const res = await fetch(url, { method: 'GET' });
+    const res = await fetch(url, fetchOptions);
     const text = await res.text();
     sample.timeMs = Math.round(performance.now() - startedAt);
     sample.status = res.status;
@@ -101,6 +130,30 @@ async function runOne({ url, assertions, thread, iter, seq }) {
     sample.pass = false;
   }
   return sample;
+}
+
+/**
+ * Convert the form's header list into a plain object suitable for
+ * fetch(). When a body is being sent and the user hasn't already
+ * supplied a Content-Type header, fall back to the form's content-type
+ * dropdown so the request is well-formed.
+ */
+export function buildHeadersObject(headers, contentType, body) {
+  const out = {};
+  let userSetContentType = false;
+
+  for (const h of headers || []) {
+    const name = String(h?.name ?? '').trim();
+    if (!name) continue;
+    if (name.toLowerCase() === 'content-type') userSetContentType = true;
+    out[name] = String(h?.value ?? '');
+  }
+
+  if (body && !userSetContentType && contentType) {
+    out['Content-Type'] = contentType;
+  }
+
+  return out;
 }
 
 function evaluateAssertions(assertions, status, ms, body) {

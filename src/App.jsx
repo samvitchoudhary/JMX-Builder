@@ -2,10 +2,39 @@ import { useMemo, useRef, useState } from 'react';
 import { buildJmx } from './jmx-builder.js';
 import { runSimulation, computeStats } from './simulator.js';
 
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
+
+const CONTENT_TYPES = [
+  'application/json',
+  'application/x-www-form-urlencoded',
+  'text/plain',
+];
+
+const DEFAULT_RESPONSE_CODES = {
+  GET: '200',
+  POST: '201',
+  PUT: '200',
+  PATCH: '200',
+  DELETE: '204',
+};
+
+const BODY_PLACEHOLDERS = {
+  'application/json': '{ "key": "value" }',
+  'application/x-www-form-urlencoded': 'key1=value1&key2=value2',
+  'text/plain': 'raw request body',
+};
+
+const HEADER_PRESETS = ['Authorization', 'Accept', 'User-Agent', 'X-API-Key'];
+
 const initialState = {
   testPlanName: 'API Load Test',
   threadGroupName: 'Users',
   url: 'https://api.example.com/v1/health',
+  method: 'GET',
+  contentType: 'application/json',
+  body: '',
+  headers: [],
   threads: 10,
   rampUp: 5,
   loops: 1,
@@ -21,12 +50,35 @@ export default function App() {
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState(false);
   const [tab, setTab] = useState('preview');
+  // Tracks whether the user has manually edited the expected response code.
+  // Until they do, switching methods updates the field to that method's
+  // conventional success code (200/201/204).
+  const responseCodeDirtyRef = useRef(false);
 
   const update = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }));
   };
 
+  const updateMethod = (nextMethod) => {
+    setForm((prev) => {
+      const next = { ...prev, method: nextMethod };
+      if (!responseCodeDirtyRef.current) {
+        next.assertions = {
+          ...prev.assertions,
+          responseCode: {
+            ...prev.assertions.responseCode,
+            value: DEFAULT_RESPONSE_CODES[nextMethod] ?? '200',
+          },
+        };
+      }
+      return next;
+    });
+  };
+
   const updateAssertion = (key, patch) => {
+    if (key === 'responseCode' && Object.prototype.hasOwnProperty.call(patch, 'value')) {
+      responseCodeDirtyRef.current = true;
+    }
     setForm((prev) => ({
       ...prev,
       assertions: {
@@ -34,6 +86,10 @@ export default function App() {
         [key]: { ...prev.assertions[key], ...patch },
       },
     }));
+  };
+
+  const updateHeaders = (nextHeaders) => {
+    setForm((prev) => ({ ...prev, headers: nextHeaders }));
   };
 
   // Live JMX recomputed on every form change. parseUrl throws on empty/invalid
@@ -76,6 +132,8 @@ export default function App() {
     }
   };
 
+  const showBodyEditor = METHODS_WITH_BODY.has(form.method);
+
   return (
     <div className="page">
       <header className="header">
@@ -84,8 +142,8 @@ export default function App() {
           <span className="brand-name">JMX Test Plan Builder</span>
         </div>
         <p className="tagline">
-          Generate Apache JMeter test plans for GET API load tests &mdash; fully
-          client-side.
+          Generate Apache JMeter test plans for HTTP API load tests &mdash;
+          fully client-side. Supports GET, POST, PUT, PATCH, and DELETE.
         </p>
       </header>
 
@@ -108,6 +166,13 @@ export default function App() {
         </Section>
 
         <Section number="02" title="HTTP Request">
+          <SelectField
+            label="HTTP Method"
+            value={form.method}
+            onChange={updateMethod}
+            options={HTTP_METHODS}
+          />
+
           <Field
             label="Target URL"
             value={form.url}
@@ -115,9 +180,26 @@ export default function App() {
             placeholder="https://api.example.com/v1/health?key=abc"
             mono
           />
+
+          {showBodyEditor && (
+            <BodyEditor
+              method={form.method}
+              contentType={form.contentType}
+              body={form.body}
+              onContentTypeChange={(v) => update('contentType', v)}
+              onBodyChange={(v) => update('body', v)}
+            />
+          )}
+
+          <HeadersEditor
+            headers={form.headers}
+            onChange={updateHeaders}
+          />
+
           <p className="hint">
-            Full URL including protocol, host, path, and query string. Method is
-            always GET.
+            {showBodyEditor
+              ? 'Request body is sent verbatim. Content-Type is added automatically unless you supply one in Headers.'
+              : `${form.method} requests have no body — only the URL and headers are sent.`}
           </p>
         </Section>
 
@@ -284,6 +366,212 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
       />
     </label>
+  );
+}
+
+function SelectField({ label, value, onChange, options }) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      <div className="select-wrap">
+        <select
+          className="input select"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        >
+          {options.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+        <span className="select-caret" aria-hidden="true">▾</span>
+      </div>
+    </label>
+  );
+}
+
+/* ============================== Body Editor ============================== */
+
+function BodyEditor({
+  method,
+  contentType,
+  body,
+  onContentTypeChange,
+  onBodyChange,
+}) {
+  const [jsonError, setJsonError] = useState('');
+
+  const handleBlur = () => {
+    if (contentType !== 'application/json') {
+      setJsonError('');
+      return;
+    }
+    if (!body || !body.trim()) {
+      setJsonError('');
+      return;
+    }
+    try {
+      JSON.parse(body);
+      setJsonError('');
+    } catch (err) {
+      setJsonError(err.message || 'Invalid JSON');
+    }
+  };
+
+  return (
+    <div className="body-editor">
+      <div className="body-editor-head">
+        <span className="field-label">
+          Request Body <span className="dim-method">· {method}</span>
+        </span>
+        <SelectField
+          label="Content-Type"
+          value={contentType}
+          onChange={(v) => {
+            onContentTypeChange(v);
+            // Clear stale JSON errors when switching to a non-JSON type.
+            if (v !== 'application/json') setJsonError('');
+          }}
+          options={CONTENT_TYPES}
+        />
+      </div>
+      <textarea
+        className="input mono body-textarea"
+        value={body}
+        onChange={(e) => onBodyChange(e.target.value)}
+        onBlur={handleBlur}
+        placeholder={BODY_PLACEHOLDERS[contentType] || ''}
+        rows={8}
+        spellCheck={false}
+      />
+      {jsonError && (
+        <div className="body-json-error">Invalid JSON: {jsonError}</div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ Headers Editor ============================ */
+
+function HeadersEditor({ headers, onChange }) {
+  const [open, setOpen] = useState(false);
+
+  const addHeader = (name = '') => {
+    onChange([...headers, { name, value: '' }]);
+    setOpen(true);
+  };
+
+  const updateRow = (index, patch) => {
+    const next = headers.map((h, i) => (i === index ? { ...h, ...patch } : h));
+    onChange(next);
+  };
+
+  const removeRow = (index) => {
+    onChange(headers.filter((_, i) => i !== index));
+  };
+
+  const count = headers.length;
+
+  return (
+    <div className={`headers-editor ${open ? 'open' : ''}`}>
+      <button
+        type="button"
+        className="headers-toggle"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className="headers-caret">{open ? '▾' : '▸'}</span>
+        <span className="headers-title">Headers</span>
+        <span className="headers-count">
+          {count > 0 ? `${count} header${count === 1 ? '' : 's'}` : 'optional'}
+        </span>
+      </button>
+
+      {open && (
+        <div className="headers-body">
+          <div className="header-presets">
+            <span className="header-presets-label">Quick add:</span>
+            {HEADER_PRESETS.map((name) => (
+              <button
+                key={name}
+                type="button"
+                className="header-chip"
+                onClick={() => addHeader(name)}
+              >
+                + {name}
+              </button>
+            ))}
+          </div>
+
+          {count === 0 ? (
+            <p className="hint headers-empty">
+              No headers yet. Add a custom row or use a preset above.
+            </p>
+          ) : (
+            <div className="header-rows">
+              {headers.map((h, i) => (
+                <div className="header-row" key={i}>
+                  <input
+                    className="input mono"
+                    type="text"
+                    value={h.name}
+                    onChange={(e) => updateRow(i, { name: e.target.value })}
+                    placeholder="Header-Name"
+                  />
+                  <input
+                    className="input mono"
+                    type="text"
+                    value={h.value}
+                    onChange={(e) => updateRow(i, { value: e.target.value })}
+                    placeholder="value"
+                  />
+                  <button
+                    type="button"
+                    className="header-remove"
+                    onClick={() => removeRow(i)}
+                    aria-label="Remove header"
+                    title="Remove header"
+                  >
+                    <TrashIcon />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="ghost header-add"
+            onClick={() => addHeader('')}
+          >
+            + Add Header
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+      <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+    </svg>
   );
 }
 
@@ -472,6 +760,10 @@ function RunPanel({ form }) {
       await runSimulation(
         {
           url: form.url,
+          method: form.method,
+          contentType: form.contentType,
+          body: METHODS_WITH_BODY.has(form.method) ? form.body : '',
+          headers: form.headers,
           threads: form.threads,
           rampUp: form.rampUp,
           loops: form.loops,
@@ -513,7 +805,7 @@ function RunPanel({ form }) {
           onClick={handleRun}
           disabled={running}
         >
-          {running ? '■ Stop' : '▶ Run Test'}
+          {running ? '■ Stop' : `▶ Run ${form.method}`}
         </button>
         <span className="progress">
           {progress.total > 0
