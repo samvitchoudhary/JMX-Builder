@@ -3,3 +3,13 @@ dist
 .env
 .DS_Store
 *.log
+
+# Python
+__pycache__/
+*.pyc
+server/.venv/
+server/.pytest_cache/
+
+# JMeter run artifacts (the backend writes to /tmp/jmx-runs by default but
+# JMX_RUNS_DIR can override that — ignore any local copies people drop here)
+jmx-runs/

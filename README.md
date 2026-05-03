@@ -16,8 +16,12 @@ check assertions before exporting to JMeter.
 - **Browser-based simulator** that mirrors JMeter `ThreadGroup` semantics
   (threads × loops, ramp-up stagger, response code / response time / body
   contains assertions)
+- **Optional server-side runner** — a Python/Flask backend that executes
+  the generated `.jmx` with real JMeter and streams results back over
+  Server-Sent Events. Toggle "Server" in the Run tab to use it.
 - **JMeter 5.6.3 compatible** output
-- **No data leaves your browser** — pure client-side, no backend
+- **Browser mode is fully client-side** — server mode is opt-in and runs
+  in a separate process
 
 ## Getting started
 
@@ -143,10 +147,87 @@ the roadmap):
 
 ```
 src/
-  App.jsx          React UI (form, preview, run panel)
+  App.jsx          React UI (form, preview, run panel, mode toggle)
   jmx-builder.js   Build the .jmx XML from the form state
-  simulator.js     Browser-side ThreadGroup simulator
+  simulator.js     Browser-side ThreadGroup simulator (browser run mode)
+  server-runner.js Client wrapper around the Flask backend SSE stream
   utils.js         XML escaping + URL parsing helpers
   styles.css       All styling
   main.jsx         App entry point
+
+server/
+  app.py           Flask app: /api/run, /api/run/<id>/stream, /stop, /health
+  jmx_builder.py   Python port of jmx-builder.js (byte-for-byte parity)
+  jtl_parser.py    Streams JMeter JTL CSV output as the file is written
+  requirements.txt flask, flask-cors, gunicorn
+  Dockerfile       python + openjdk + JMeter 5.6.3
+
+scripts/
+  check_jmx_parity.mjs   Dump JS-built JMX for several configs
+  check_jmx_parity.py    Diff JS vs Python output (run this after edits)
 ```
+
+## Server (real JMeter) mode
+
+The browser simulator is great for sanity checks but is bounded by browser
+fetch limits and CORS. The optional Python backend runs the generated
+`.jmx` against real JMeter and streams the results live.
+
+### Run the backend locally
+
+You'll need Python 3.11+, Java 17, and Apache JMeter 5.6.3 on your `PATH`.
+The easiest way is the Docker image:
+
+```bash
+cd server
+docker build -t jmx-backend .
+docker run --rm -p 5000:5000 jmx-backend
+# verify:
+curl http://localhost:5000/api/health
+# → {"jmeter_version": "5.6.3", "ok": true}
+```
+
+Or, if JMeter is installed locally:
+
+```bash
+cd server
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python app.py     # listens on :5000
+```
+
+Then run the frontend dev server in another terminal — it proxies `/api/*`
+to `localhost:5000` automatically:
+
+```bash
+npm run dev
+```
+
+In the Run tab, switch the toggle to **Server**. Click **▶ Run** and you'll
+see real JMeter samples populate the table as JMeter writes them. The
+**■ Stop** button SIGTERMs the JMeter subprocess.
+
+### Production deployment
+
+Set `VITE_API_URL` at build time when the backend is on a different origin
+(e.g. a separate Railway service):
+
+```bash
+VITE_API_URL=https://jmx-backend.example.app npm run build
+```
+
+The backend uses gunicorn with the `gthread` worker class so SSE streams
+don't tie up workers (each open stream holds a thread, not a process).
+
+### Caps
+
+The backend rejects runs above these limits with a `400`; the UI also
+validates client-side:
+
+| Setting   | Cap   |
+| --------- | ----- |
+| Threads   | 5000  |
+| Ramp-up   | 3600s |
+| Loops     | 10000 |
+
+A single run also has a hard 10-minute server-side timeout.

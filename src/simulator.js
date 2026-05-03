@@ -24,9 +24,12 @@ const METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH']);
  * }} config
  * @param {(sample: object) => void} [onSample]
  * @param {(progress: { done: number, total: number }) => void} [onProgress]
+ * @param {AbortSignal} [signal]  When aborted, in-flight fetches are cancelled
+ *   and no new samples are scheduled. Already-completed samples are still
+ *   returned and reported via onSample.
  * @returns {Promise<object[]>}
  */
-export async function runSimulation(config, onSample, onProgress) {
+export async function runSimulation(config, onSample, onProgress, signal) {
   const url = String(config.url || '').trim();
   if (!url) throw new Error('URL is required');
 
@@ -53,6 +56,7 @@ export async function runSimulation(config, onSample, onProgress) {
       (async () => {
         if (startDelay > 0) await sleep(startDelay);
         for (let l = 0; l < loops; l++) {
+          if (signal?.aborted) return;
           const sample = await runOneSample({
             url,
             method,
@@ -63,6 +67,7 @@ export async function runSimulation(config, onSample, onProgress) {
             thread: t + 1,
             iter: l + 1,
             seq: ++order,
+            signal,
           });
           samples.push(sample);
           completed += 1;
@@ -78,7 +83,7 @@ export async function runSimulation(config, onSample, onProgress) {
 }
 
 async function runOneSample(config) {
-  const { url, method, body, contentType, headers, assertions } = config;
+  const { url, method, body, contentType, headers, assertions, signal } = config;
   const sample = {
     seq: config.seq,
     id: `${config.thread}-${config.iter}-${config.seq}`,
@@ -105,6 +110,9 @@ async function runOneSample(config) {
   if (willSendBody) {
     fetchOptions.body = body;
   }
+  if (signal) {
+    fetchOptions.signal = signal;
+  }
 
   const startedAt = performance.now();
   try {
@@ -124,7 +132,9 @@ async function runOneSample(config) {
       sample.assertionResults.every((r) => r.pass);
   } catch (err) {
     sample.timeMs = Math.round(performance.now() - startedAt);
-    sample.error = err?.message || 'Network error';
+    sample.error = err?.name === 'AbortError'
+      ? 'Stopped by user'
+      : (err?.message || 'Network error');
     sample.status = 'ERR';
     sample.assertionResults = [];
     sample.pass = false;
